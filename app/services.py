@@ -1,10 +1,15 @@
-"""名单与封存/揭晓的写流程（状态检查、名单读写必须在同一个 IMMEDIATE 事务内）。
+"""名单与封存/揭晓/弃权的写流程（状态检查、名单读写必须在同一个 IMMEDIATE 事务内）。
 
 每个 ``*_tx`` 函数只负责在调用方给定的事务（``db.transaction(conn)``）内完成
 “重新读取轮次状态 → 读名单 → 校验 → 写数据”，自身不提交、不回滚：
 
 - HTTP 路由在请求事务中提交，请求间由 IMMEDIATE 写锁串行；
 - 确定性交错测试可以用两个真实 SQLite 连接精确安排两边的加锁/提交先后。
+
+弃权与递补（仅 revealed 状态）：见 RULES.md 第 4 节。第 k 次弃权（k 从 0 起，
+按操作顺序）的递补编号是按既有 sha256-argmax-v1 规则“接着抽”第 prize_count+k
+轮的结果，即扩展抽签序列的第 prize_count+k 个编号；无候补时席位留空。
+弃权记录与递补在同一事务、同一行内一次写入，不会只记弃权不记递补。
 """
 import json
 import secrets
@@ -203,3 +208,89 @@ def reveal_round_tx(conn, round_id: str, raw_seed: str):
     )
     return {"revealed": True, "winners": winners,
             "row": get_round(conn, round_id)}
+
+
+# ---------------------------------------------------------------- 弃权与递补
+
+def forfeit_rows(conn, round_id: str) -> list[dict]:
+    """按操作顺序返回一轮次的全部弃权记录。"""
+    rows = conn.execute(
+        "SELECT seq, entry_id, replacement, created_at FROM forfeits "
+        "WHERE round_id=? ORDER BY seq",
+        (round_id,),
+    ).fetchall()
+    return [
+        {
+            "seq": r["seq"],
+            "entry": r["entry_id"],
+            "replacement": r["replacement"],
+            "at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
+def current_slots(winners: list[str], forfeits: list[dict]) -> list:
+    """由原始中奖名单与弃权记录逐次原位替换，推出当前有效席位。
+
+    返回与 ``winners`` 等长的列表，元素为当前有效编号或 None（空席）。
+    纯函数：网页与核验器按同一规则独立重演（RULES.md 第 4 节）。
+    """
+    slots = list(winners)
+    for f in forfeits:
+        idx = slots.index(f["entry"])  # forfeit_tx 保证 entry 当时在席位中
+        slots[idx] = f["replacement"]
+    return slots
+
+
+def forfeit_tx(conn, round_id: str, raw_entry):
+    """把当前有效中奖编号标记弃权，并按既有规则立即递补（同一事务内）。
+
+    返回 dict，由路由组装响应：
+    - already_forfeited：该编号此前已登记弃权，不重复递补，返回既有结果（幂等）；
+    - 否则追加一条 forfeits 记录，递补为扩展抽签序列的下一个编号，
+      名单已无人可补时 replacement=None（席位留空）。
+    原始中奖名单（winners_json）与揭晓时间（revealed_at）始终不变。
+    """
+    row = get_round(conn, round_id)
+    if row is None:
+        raise ApiError("轮次不存在", 404)
+    if row["status"] != "revealed":
+        raise ApiError("轮次尚未揭晓，不能标记弃权", 409)
+
+    entry = rules.normalize_entry(raw_entry if isinstance(raw_entry, str) else "")
+    if not entry:
+        raise ApiError("请指定要弃权的编号")
+
+    winners = json.loads(row["winners_json"])
+    forfeits = forfeit_rows(conn, round_id)
+
+    # 幂等：同一编号重复提交弃权，只返回既有结果
+    if any(f["entry"] == entry for f in forfeits):
+        return {"already_forfeited": True, "row": row}
+
+    slots = current_slots(winners, forfeits)
+    if entry not in slots:
+        raise ApiError(f"编号 {entry} 不是当前有效中奖编号，不能弃权", 409)
+
+    # 递补：按既有规则“接着抽”——第 seq 次弃权对应扩展序列第 prize_count+seq 个
+    # （候选池为封存名单减去此前全部已出现编号，因此递补绝不重复）。
+    seq = len(forfeits)
+    entries = row["snapshot"].split("\n") if row["snapshot"] else []
+    draw_index = row["prize_count"] + seq
+    replacement = None
+    if draw_index < len(entries):
+        replacement = rules.draw_winners(
+            entries, row["seed_hex"], draw_index + 1
+        )[draw_index]
+
+    conn.execute(
+        "INSERT INTO forfeits (round_id,seq,entry_id,replacement,created_at) "
+        "VALUES (?,?,?,?,?)",
+        (round_id, seq, entry, replacement, now_iso()),
+    )
+    return {
+        "forfeited": True,
+        "forfeit": {"seq": seq, "entry": entry, "replacement": replacement},
+        "row": get_round(conn, round_id),
+    }

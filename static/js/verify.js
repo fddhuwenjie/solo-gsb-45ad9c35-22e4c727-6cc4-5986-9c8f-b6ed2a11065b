@@ -154,7 +154,88 @@
 
     heading("独立重算的中奖编号（按产生顺序）");
     recalc.forEach(function (w, i) { info("  " + (i + 1) + ". " + w); });
+
+    // ---- 弃权与递补：从种子与名单独立重演（旧版包无此字段，按无弃权处理）----
+    if (!("forfeits" in pkg) && !("currentWinners" in pkg)) {
+      info("旧版核验包：无弃权字段，按无弃权处理。");
+    } else {
+      verifyForfeits(pkg, entries, seed, rnd.prizeCount, recalc, pass, fail, info, heading);
+    }
     return finish(failures);
+  }
+
+  // 重演弃权/递补记录（RULES.md 第 4 节）：第 k 次弃权的递补必须是扩展抽签
+  // 序列的第 prizeCount+k 个编号；弃权时该编号必须仍在有效席位中；
+  // 最终当前席位必须与包内 currentWinners 完全一致。
+  function verifyForfeits(pkg, entries, seed, prizeCount, recalc, pass, fail, info, heading) {
+    var forfeits = pkg.forfeits;
+    if (!Array.isArray(forfeits)) {
+      fail("forfeits 字段必须是数组");
+      return;
+    }
+    for (var q = 0; q < forfeits.length; q++) {
+      if (!forfeits[q] || forfeits[q].seq !== q) {
+        fail("弃权记录 seq 不连续或缺失（应为 0,1,2,… 连续编号）");
+        break;
+      }
+    }
+
+    var total = prizeCount + forfeits.length;
+    var extended = LotteryRules.drawWinners(entries, seed, Math.min(total, entries.length));
+    var slots = recalc.slice();
+    for (var j = 0; j < forfeits.length; j++) {
+      var f = forfeits[j];
+      var expect = (prizeCount + j) < entries.length ? extended[prizeCount + j] : null;
+      if (slots.indexOf(f.entry) < 0) {
+        fail("第 " + (j + 1) + " 条弃权记录无法重演：编号 " + f.entry +
+             " 当时不在有效席位中（弃权顺序被篡改或记录系伪造）");
+        return;
+      }
+      var rep = f.replacement === undefined ? null : f.replacement;
+      if (rep !== expect) {
+        fail("第 " + (j + 1) + " 条弃权（" + f.entry + "）的递补不符：包内为 " +
+             (rep === null ? "（空）" : rep) + "，按规则应为 " +
+             (expect === null ? "（无候补）" : expect) + "（伪造或跳过的递补）");
+        return;
+      }
+      slots[slots.indexOf(f.entry)] = expect;
+    }
+
+    if (forfeits.length) {
+      pass(forfeits.length + " 条弃权/递补记录按规则从种子与名单重演，全部一致");
+    } else {
+      pass("无弃权记录");
+    }
+
+    var current = pkg.currentWinners;
+    if (!Array.isArray(current) || current.length !== prizeCount) {
+      fail("currentWinners 缺失或不是与名额等长的数组");
+    } else {
+      var same = current.every(function (s, i) { return s === slots[i]; });
+      if (!same) {
+        var diffs = [];
+        for (var i = 0; i < slots.length; i++) {
+          if (current[i] !== slots[i]) {
+            diffs.push("席位 " + (i + 1) + "：包内 " + current[i] + "，重演 " + slots[i]);
+          }
+        }
+        fail("当前有效席位与弃权重演结果不一致：\n" + diffs.slice(0, 20).join("\n"));
+      } else {
+        pass("当前有效席位（currentWinners）与弃权重演结果一致");
+      }
+    }
+
+    if (forfeits.length) {
+      heading("弃权与递补记录（按操作顺序，已经规则重演核对）");
+      forfeits.forEach(function (f) {
+        info("  #" + (f.seq + 1) + " 弃权 " + f.entry + " → 递补 " +
+             (f.replacement == null ? "（无候补，席位留空）" : f.replacement));
+      });
+      heading("当前有效席位");
+      slots.forEach(function (s, i) {
+        info("  " + (i + 1) + ". " + (s === null ? "（空席）" : s));
+      });
+    }
   }
 
   function finish(failures) {

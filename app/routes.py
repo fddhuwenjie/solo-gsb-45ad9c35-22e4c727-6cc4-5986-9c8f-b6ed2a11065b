@@ -58,6 +58,7 @@ def round_public_dict(row, *, include_snapshot: bool = True) -> dict:
     db = get_db()
     participants = services.participant_rows(db, row["id"])
     winners = json.loads(row["winners_json"]) if row["winners_json"] else None
+    forfeits = services.forfeit_rows(db, row["id"])
     data = {
         "id": row["id"],
         "title": row["title"],
@@ -74,6 +75,11 @@ def round_public_dict(row, *, include_snapshot: bool = True) -> dict:
         "revealedAt": row["revealed_at"],
         "seed": row["seed_hex"],
         "winners": winners,
+        # 弃权记录与当前有效席位（未揭晓时分别为 [] 与 None）
+        "forfeits": forfeits,
+        "slots": services.current_slots(winners, forfeits)
+        if winners is not None
+        else None,
         "participants": participants,
     }
     if include_snapshot and row["snapshot"] is not None:
@@ -228,6 +234,43 @@ def reveal_round(round_id):
     )
 
 
+# ---------------------------------------------------------------- 弃权与递补
+
+@bp.post("/api/rounds/<round_id>/forfeit")
+def forfeit_entry(round_id):
+    body = request.get_json(silent=True) or {}
+    db = get_db()
+    try:
+        with transaction(db):
+            result = services.forfeit_tx(db, round_id, body.get("entry"))
+    except ApiError as e:
+        return _error_response(e)
+
+    # 重复提交同一弃权：不重复递补，返回既有结果
+    if result.get("already_forfeited"):
+        return jsonify(
+            {
+                "ok": True,
+                "alreadyForfeited": True,
+                "message": "该编号已登记弃权，重复提交返回既有结果，不重复递补",
+                "round": round_public_dict(result["row"]),
+            }
+        )
+
+    f = result["forfeit"]
+    return jsonify(
+        {
+            "ok": True,
+            "forfeit": {
+                "seq": f["seq"],
+                "entry": f["entry"],
+                "replacement": f["replacement"],
+            },
+            "round": round_public_dict(result["row"]),
+        }
+    )
+
+
 # ---------------------------------------------------------------- 核验包
 
 def build_manifest(row) -> dict:
@@ -240,6 +283,8 @@ def build_manifest(row) -> dict:
                              key=lambda e: e.encode("utf-8"))
         count = len(entries_ids)
 
+    winners = json.loads(row["winners_json"]) if row["winners_json"] else None
+    forfeits = services.forfeit_rows(get_db(), row["id"])
     return {
         "format": "public-lottery-verification-v1",
         "ruleId": rules.RULE_ID,
@@ -257,10 +302,17 @@ def build_manifest(row) -> dict:
         },
         "participants": entries_ids,
         "participantCount": count,
-        "winners": json.loads(row["winners_json"]) if row["winners_json"] else None,
+        "winners": winners,
+        # 弃权与递补（RULES.md 第 4 节）；旧版包无此二字段，核验器按无弃权处理
+        "forfeits": forfeits,
+        "currentWinners": services.current_slots(winners, forfeits)
+        if winners is not None
+        else None,
         "notes": (
             "用 verify/verify.py 对本文件独立重算校验；切勿只比对本包内 winners 字段。"
             "封存后（含未揭晓）即可导出并对照事先留存的承诺与名单摘要。"
+            "forfeits/currentWinners 为弃权递补记录与当前有效席位，"
+            "核验器会从种子与封存名单按规则独立重演，能指出伪造或跳过的递补。"
         ),
     }
 

@@ -38,6 +38,10 @@
 5. **抽奖规则**：第 `i` 轮（`i=0,1,…`）对每个未中奖编号 `id` 计算
    `score = int_be(SHA256("sha256-argmax-v1|"+seed+"|"+id+"|"+i))`，取分数最大者，
    平局取字节序靠前者。全程不取模，没有取模偏置。
+6. **弃权与递补（揭晓后）**：可将当前有效中奖编号标记弃权；第 `k` 次弃权（`k=0,1,…`，
+   按操作顺序）的递补者即按同一规则**继续抽第 `名额+k` 轮**的结果（候选池为封存名单
+   减去此前全部已出现编号，递补绝不重复）；名单无人可补时席位留空。
+   原始中奖顺序与揭晓时间始终不变，弃权只追加记录并改变“当前有效席位”。
 
 > 安全性前提：操作者在揭晓前对种子保密；承诺与名单摘要由现场监督方事先独立留存。
 > 服务器只是“承诺托管板 + 防篡改的名单快照”，种子从不被服务器提前掌握。
@@ -106,9 +110,21 @@ docker compose up -d --build
 3. 种子正确 → 页面按产生顺序展示中奖编号、揭晓种子与时间；结果永久固定，
    再次提交任何种子都不会重抽。
 
-### 步骤 5：导出与核验
+### 步骤 5：弃权与递补（揭晓后，可选）
+
+1. 结果表按席位展示**原中奖编号**、**当前有效编号**与**递补经过**；
+   每个仍有效的席位行尾有 **“弃权”** 按钮。
+2. 点击“弃权”并确认后，系统立即按同一公开规则从封存名单中接着选出
+   尚未出现的编号补入该席位；名单无人可补时该席位留空（显示“（空席）”）。
+3. 原中奖者或递补者都可弃权，可逐次操作多次；“弃权与递补记录”卡片按操作
+   顺序列出每次弃权的时间、编号与递补结果。
+4. 原始中奖顺序与揭晓时间永远不变；重复提交同一编号的弃权只会返回既有结果，
+   不会重复递补。
+
+### 步骤 6：导出与核验
 
 点击 **“下载 ZIP 核验包”**（或仅下载 `package.json`），交给任意监督方核验。
+核验包附弃权记录（`forfeits`）与当前有效席位（`currentWinners`）。
 可在 <http://localhost:8000/verify> 上传 `package.json` 在线核验，
 或用包内 `verify.py` 命令行核验（见下一节）。
 
@@ -176,10 +192,36 @@ curl -s -X POST localhost:8000/api/rounds/$RID/reveal \
 ```
 
 ```bash
-# 5) 导出核验包
+# 5) 弃权与递补（揭晓后）
+# 将当前有效中奖编号 A003 标记弃权：立即按规则递补下一位
+curl -s -X POST localhost:8000/api/rounds/$RID/forfeit \
+  -H 'Content-Type: application/json' -d '{"entry":"A003"}'
+# {"ok":true,"forfeit":{"seq":0,"entry":"A003","replacement":"A002"},...}
+# round.slots 为当前有效席位：["A002","A005","A001"]；round.forfeits 为弃权记录
+# 原始 round.winners（["A003","A005","A001"]）与 round.revealedAt 不变
+
+# 递补者也可再弃权（A002 → 递补 A004）；名单 5 人全部出现后，再弃权则席位留空：
+curl -s -X POST localhost:8000/api/rounds/$RID/forfeit \
+  -H 'Content-Type: application/json' -d '{"entry":"A002"}'
+# {"ok":true,"forfeit":{"seq":1,"entry":"A002","replacement":"A004"},...}
+
+# 重复提交同一弃权：返回既有结果，不重复递补
+curl -s -X POST localhost:8000/api/rounds/$RID/forfeit \
+  -H 'Content-Type: application/json' -d '{"entry":"A003"}'
+# {"ok":true,"alreadyForfeited":true,"message":"该编号已登记弃权，……",...}
+
+# 非当前有效编号（如从未上岗的编号）：不可操作（HTTP 409）
+curl -s -X POST localhost:8000/api/rounds/$RID/forfeit \
+  -H 'Content-Type: application/json' -d '{"entry":"A006"}'
+# {"ok":false,"error":"编号 A006 不是当前有效中奖编号，不能弃权"}
+```
+
+```bash
+# 6) 导出核验包
 curl -s -OJ localhost:8000/api/rounds/$RID/package.zip
 unzip lottery-$RID-package.zip
 # 生成目录 lottery-$RID/：package.json  list.txt  RULES.md  verify.py
+# package.json 内含 forfeits（弃权记录）与 currentWinners（当前有效席位）
 ```
 
 ---
@@ -190,9 +232,9 @@ unzip lottery-$RID-package.zip
 
 | 文件 | 内容 |
 | --- | --- |
-| `package.json` | 轮次元数据、承诺、种子（未揭晓时为 `null`）、规范名单、名单摘要、规则标识、中奖结果 |
+| `package.json` | 轮次元数据、承诺、种子（未揭晓时为 `null`）、规范名单、名单摘要、规则标识、中奖结果、弃权记录（`forfeits`）与当前有效席位（`currentWinners`） |
 | `list.txt` | 规范名单（每行一个编号） |
-| `RULES.md` | 抽奖规则全文 |
+| `RULES.md` | 抽奖规则全文（含弃权与递补规则） |
 | `verify.py` | 独立核验脚本，**仅依赖 Python 3 标准库** |
 
 命令行核验（Python 3.8+，无需安装任何东西）：
@@ -207,7 +249,11 @@ python3 verify.py package.json
 2. 对名单重排、查重并重算规范快照摘要，与包内摘要比对；
 3. 检查中奖编号数量、唯一性、是否都在名单内；
 4. **从种子和名单按 `sha256-argmax-v1` 重新抽奖**，与包内结果逐项比对；
-5. 任何不符逐条打印 `[不符]`，进程以退出码 `1` 结束；全部通过输出“全部核验通过”，退出码 `0`。
+5. **重演弃权与递补**：第 `k` 次弃权的递补必须等于扩展抽签序列的第 `名额+k` 个
+   编号，弃权发生时该编号必须仍在有效席位中，最终当前席位必须与包内
+   `currentWinners` 完全一致——伪造或跳过的递补都会被逐条指出；
+   旧版核验包（无弃权字段）按无弃权处理，照常核验通过；
+6. 任何不符逐条打印 `[不符]`，进程以退出码 `1` 结束；全部通过输出“全部核验通过”，退出码 `0`。
 
 结合事先留存的承诺和名单摘要（推荐的真正“外部”核验）：
 
@@ -227,8 +273,11 @@ zip 也可直接传入：`python3 verify.py lottery-<编号>-package.zip`。
 第 3 位 A001
 ```
 
-你可以自行做篡改实验：改 `package.json` 里的一个中奖编号、调换名单顺序、换一个种子……
-核验器都会指出具体不符项。
+若随后发生弃权，扩展抽签序列（同一规则继续往下抽）依次是 `A002`、`A004`：
+第 1 次弃权补入 `A002`，第 2 次补入 `A004`，再往后名单无人可补，席位留空。
+
+你可以自行做篡改实验：改 `package.json` 里的一个中奖编号、调换名单顺序、换一个种子、
+伪造一条递补或删掉一条弃权记录……核验器都会指出具体不符项。
 
 > 封存后、揭晓前也可以导出核验包：此时包内种子与结果为空，核验器核对承诺与名单摘要，
 > 并提示“处于封存（未揭晓）状态”。
@@ -259,21 +308,21 @@ gunicorn 建议保持单 worker（SQLite 写串行化即可；多线程没有问
 .
 ├── app/
 │   ├── __init__.py        # Flask 应用工厂（静态目录指向仓库根 static/）
-│   ├── db.py              # SQLite 连接、建表、IMMEDIATE 写事务、状态机注释
+│   ├── db.py              # SQLite 连接、建表（含 forfeits 弃权表）、IMMEDIATE 写事务、状态机注释
 │   ├── rules.py           # 公开规则的 Python 实现（唯一事实来源之一）
-│   ├── services.py        # 名单/封存/揭晓写流程：事务内重新检查状态再读写
+│   ├── services.py        # 名单/封存/揭晓/弃权写流程：事务内重新检查状态再读写
 │   ├── routes.py          # 页面路由、JSON API、核验包 zip/json 导出
 │   └── templates/         # index / round / verify 三个页面（Jinja2）
-├── tests/                 # 顺序流程回归 + 确定性交错验证 + HTTP 并发不变量
+├── tests/                 # 顺序流程回归 + 弃权递补 + 确定性交错验证 + HTTP 并发不变量
 ├── static/
 │   ├── css/style.css
 │   └── js/
 │       ├── sha256.js      # 纯 JS SHA-256（无需安全上下文/CDN）
-│       ├── rules.js       # 与 Python 等价的浏览器规则实现（BigInt）
+│       ├── rules.js       # 与 Python 等价的浏览器规则实现（BigInt，含席位重演）
 │       ├── common.js      # fetch/转义/复制/下载工具
 │       ├── index.js       # 生成种子、只交承诺、轮次列表
-│       ├── round.js       # 名单增改、封存、揭晓、导出
-│       └── verify.js      # 浏览器内核验（独立重算）
+│       ├── round.js       # 名单增改、封存、揭晓、弃权递补、导出
+│       └── verify.js      # 浏览器内核验（独立重算 + 弃权重演）
 ├── verify/verify.py       # 独立核验脚本（仅 Python 标准库）
 ├── RULES.md               # 规则全文
 ├── wsgi.py                # gunicorn wsgi:app
@@ -282,7 +331,8 @@ gunicorn 建议保持单 worker（SQLite 写串行化即可；多线程没有问
 └── docker-compose.yml
 ```
 
-状态机：`open`（可改名单）→ `sealed`（快照+摘要固定，等种子）→ `revealed`（结果永久固定）。
+状态机：`open`（可改名单）→ `sealed`（快照+摘要固定，等种子）→ `revealed`（结果永久固定，
+此后只允许追加弃权记录；原始中奖名单与揭晓时间不变，当前有效席位随弃权递补更新）。
 
 并发与事务：名单新增、删除、整体替换与封存都在同一个 `BEGIN IMMEDIATE` 写事务内
 **先重新读取轮次状态与名单、再校验和写入、最后一次提交**。SQLite 的立即写锁使这些
@@ -294,6 +344,11 @@ gunicorn 建议保持单 worker（SQLite 写串行化即可；多线程没有问
   参与者表保持封存时内容，快照与摘要不变；
 - 重复封存返回既有快照（`alreadySealed`），不重算、不覆盖。
 
+弃权同理：每次弃权在写事务内重新读取既有弃权记录后追加，同一轮次的并发弃权
+串行生效——两次弃权分别取得扩展抽签序列中不同的下一个递补，不会同一人占两个
+席位；弃权与递补在同一事务同一行一次写入，不会只记弃权不记递补；
+重复提交同一弃权返回既有结果（`alreadyForfeited`），不重复递补。
+
 测试（仅依赖 Flask，标准库 `unittest`，不改动任何既有接口）：
 
 ```bash
@@ -303,6 +358,9 @@ python3 -m unittest discover -t . -s tests -v
 
 - `tests/test_sequential_flow.py`：按本 README 的命令行示例走完整流程，并用包内
   `verify.py` 独立核验导出的 JSON / ZIP 核验包；
+- `tests/test_forfeit.py`：弃权与递补——顺序流程（递补值与规则重算一致、幂等、
+  空席、原始结果不变）、核验包重演与篡改检测（伪造/跳过的递补、旧版包兼容）、
+  HTTP 并发弃权不变量、确定性交错（后到弃权读到先到记录并取下一个递补）；
 - `tests/test_interleave.py`：**确定性交错验证**——用两个真实 SQLite 连接手工安排
   新增/整体替换/删除与封存的加锁、阻塞与两种提交先后；
 - `tests/test_concurrent_http.py`：多线程真实 HTTP 请求并发新增/替换 + 封存的
@@ -314,11 +372,12 @@ python3 -m unittest discover -t . -s tests -v
 | --- | --- |
 | `POST /api/rounds` | 创建轮次：`{title, prizeCount, commitment}` |
 | `GET  /api/rounds` | 轮次列表 |
-| `GET  /api/rounds/<id>` | 轮次详情（含名单/快照/结果） |
+| `GET  /api/rounds/<id>` | 轮次详情（含名单/快照/结果/弃权记录/当前席位） |
 | `POST /api/rounds/<id>/participants` | 添加编号（仅 open） |
 | `PUT  /api/rounds/<id>/participants` | 整体替换名单（仅 open） |
 | `DELETE /api/rounds/<id>/participants/<编号>` | 删除编号（仅 open） |
 | `POST /api/rounds/<id>/seal` | 封存（人数 ≥ 名额；幂等） |
 | `POST /api/rounds/<id>/reveal` | 提交种子；不匹配保持封存，重复揭晓不重抽 |
+| `POST /api/rounds/<id>/forfeit` | 弃权：`{entry}` 须为当前有效编号（仅 revealed）；按规则递补或留空席；重复提交返回既有结果 |
 | `GET  /api/rounds/<id>/package.json` | 导出 JSON 核验包 |
 | `GET  /api/rounds/<id>/package.zip` | 导出 ZIP 核验包（含规则与核验器） |

@@ -80,15 +80,30 @@
 
 <!-- 结果 -->
 <div class="card" id="resultCard" style="display:none;">
-  <h2>🎉 中奖结果（已永久固定）</h2>
+  <h2>🎉 中奖结果（原始结果与揭晓时间永久固定）</h2>
   <dl class="meta">
     <dt>揭晓种子</dt><dd><div class="hash-box" id="resultSeed"></div></dd>
     <dt>揭晓时间</dt><dd id="revealedAt" class="mono"></dd>
   </dl>
   <table style="margin-top:10px;">
-    <thead><tr><th class="rank">名次</th><th>中奖编号</th></tr></thead>
+    <thead><tr><th class="rank">席位</th><th>原中奖编号</th><th>当前有效编号</th><th>递补经过</th><th></th></tr></thead>
     <tbody id="winnerList"></tbody>
   </table>
+  <p class="muted">
+    原始中奖顺序与揭晓时间永不改变。揭晓后可将某个<strong>当前有效编号</strong>标记弃权：
+    系统立即按同一公开规则（sha256-argmax-v1）从封存名单中接着选出尚未出现的编号补入其席位；
+    名单无人可补时席位留空。弃权只追加记录，不改写原始结果。
+  </p>
+</div>
+
+<!-- 弃权与递补记录 -->
+<div class="card" id="forfeitCard" style="display:none;">
+  <h2>弃权与递补记录（按操作顺序）</h2>
+  <table>
+    <thead><tr><th class="rank">#</th><th>时间</th><th>弃权编号</th><th>递补编号</th></tr></thead>
+    <tbody id="forfeitList"></tbody>
+  </table>
+  <p class="muted">以上记录随核验包导出，核验器会从种子与封存名单独立重演核对。</p>
 </div>
 
 <!-- 导出核验包 -->

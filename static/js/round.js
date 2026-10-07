@@ -79,9 +79,39 @@
     if (status === "revealed") {
       $("resultSeed").textContent = round.seed;
       $("revealedAt").textContent = round.revealedAt || "";
+      var forfeits = round.forfeits || [];
+      var replay = LotteryRules.replaySlots(round.winners || [], forfeits);
       $("winnerList").innerHTML = (round.winners || []).map(function (w, i) {
-        return '<tr class="winner-row"><td class="rank">' + (i + 1) +
-          '</td><td class="mono">🏆 ' + UI.esc(w) + "</td></tr>";
+        var cur = replay.slots[i];
+        var chain = replay.chains[i];
+        var curCell = cur == null
+          ? '<span class="muted">（空席）</span>'
+          : (cur === w
+              ? '<span class="mono">🏆 ' + UI.esc(cur) + "</span>"
+              : '<span class="mono tag-new">🏆 ' + UI.esc(cur) + "（递补）</span>");
+        var action = cur == null
+          ? ""
+          : '<button class="danger" data-forfeit="' + UI.esc(cur) + '">弃权</button>';
+        return (
+          '<tr class="winner-row"><td class="rank">' + (i + 1) + "</td>" +
+          '<td class="mono">' + UI.esc(w) + "</td>" +
+          "<td>" + curCell + "</td>" +
+          '<td class="mono">' + UI.esc(chain.length > 1 ? chain.join(" → ") : "—") + "</td>" +
+          "<td>" + action + "</td></tr>"
+        );
+      }).join("");
+      Array.prototype.forEach.call(document.querySelectorAll("[data-forfeit]"), function (btn) {
+        btn.addEventListener("click", function () { forfeitEntry(btn.getAttribute("data-forfeit")); });
+      });
+
+      $("forfeitCard").style.display = forfeits.length ? "block" : "none";
+      $("forfeitList").innerHTML = forfeits.map(function (f) {
+        return (
+          "<tr><td class='rank'>" + (f.seq + 1) + "</td>" +
+          "<td class='mono'>" + UI.esc(f.at || "") + "</td>" +
+          "<td class='mono'>" + UI.esc(f.entry) + "</td>" +
+          "<td class='mono'>" + (f.replacement == null ? "（无候补，席位留空）" : UI.esc(f.replacement)) + "</td></tr>"
+        );
       }).join("");
     }
 
@@ -180,6 +210,33 @@
       UI.flash(flashEl, e.message + (e.data && e.data.commitMismatch ? "" : ""), "err");
       await refresh();
     }
+  }
+
+  // ---------------- 弃权与递补（仅 revealed）
+
+  async function forfeitEntry(entry) {
+    if (!confirm(
+      "确认将当前有效编号「" + entry + "」标记弃权？\n" +
+      "系统会立即按公开规则从封存名单中递补下一位（若无候补则席位留空），" +
+      "原始中奖结果与揭晓时间不变。"
+    )) return;
+    try {
+      var data = await UI.api("/api/rounds/" + encodeURIComponent(ROUND_ID) + "/forfeit", {
+        method: "POST",
+        body: JSON.stringify({ entry: entry }),
+      });
+      if (data.alreadyForfeited) {
+        UI.flash(flashEl, data.message, "warn");
+      } else {
+        var rep = data.forfeit && data.forfeit.replacement;
+        UI.flash(
+          flashEl,
+          "已记录弃权：" + entry + (rep ? "，递补为 " + rep : "，名单已无人可补，席位留空") + "。",
+          "ok"
+        );
+      }
+      await refresh();
+    } catch (e) { UI.flash(flashEl, e.message, "err"); }
   }
 
   $("addBtn").addEventListener("click", addEntry);

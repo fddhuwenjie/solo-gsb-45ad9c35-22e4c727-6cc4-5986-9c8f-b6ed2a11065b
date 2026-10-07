@@ -8,7 +8,9 @@
                                    --list-digest <事先留存的名单摘要>
 
 本脚本只使用 Python 3 标准库。它不会相信核验包里的 winners 字段：
-中奖编号一律由种子和名单按公开规则重新计算后逐项比对。
+中奖编号一律由种子和名单按公开规则重新计算后逐项比对；
+弃权/递补记录（forfeits/currentWinners，RULES.md 第 4 节）也从种子与名单
+独立重演核对，能指出伪造或跳过的递补。旧版核验包（无弃权字段）按无弃权处理。
 发现任何不符，退出码为 1；全部通过退出码为 0。
 """
 import argparse
@@ -219,10 +221,92 @@ def verify(pkg, expected_commitment=None, expected_digest=None):
         print("独立重算的中奖编号（按产生顺序）：")
         for i, w in enumerate(recalc, 1):
             print(f"  {i:>3}. {w}")
+
+        # ---- 弃权与递补：从种子与名单独立重演（旧版包无此字段，按无弃权处理）----
+        if "forfeits" not in pkg and "currentWinners" not in pkg:
+            ok("旧版核验包：无弃权字段，按无弃权处理")
+        else:
+            _verify_forfeits(pkg, entries, seed, prize_count, recalc, ok, fail)
     elif prize_count is not None and prize_count > len(entries):
         fail(f"人数 {len(entries)} 少于名额 {prize_count}，按规则本不该封存/揭晓")
 
     return errors, checks
+
+
+def _verify_forfeits(pkg, entries, seed, prize_count, recalc, ok, fail):
+    """重演弃权/递补记录（RULES.md 第 4 节）。
+
+    第 k 次弃权（k 从 0 起）的递补必须是扩展抽签序列的第 prize_count+k 个
+    编号；弃权发生时该编号必须仍在有效席位中；最终当前席位必须与包内
+    currentWinners 完全一致。任何不符都说明记录被伪造或递补被跳过。
+    """
+    forfeits = pkg.get("forfeits")
+    current = pkg.get("currentWinners")
+    if not isinstance(forfeits, list) or not all(
+        isinstance(f, dict) for f in forfeits
+    ):
+        fail("forfeits 字段必须是对象数组")
+        return
+    if [f.get("seq") for f in forfeits] != list(range(len(forfeits))):
+        fail("弃权记录 seq 不连续或缺失（应为 0,1,2,… 连续编号）")
+
+    # 扩展序列：名额 + 弃权次数，受名单人数限制（超出部分无候补，席位留空）
+    total = prize_count + len(forfeits)
+    extended = draw_winners(entries, seed, min(total, len(entries)))
+
+    slots = list(recalc)
+    for j, f in enumerate(forfeits):
+        entry = f.get("entry")
+        expect = (
+            extended[prize_count + j]
+            if prize_count + j < len(entries)
+            else None
+        )
+        if entry not in slots:
+            fail(
+                f"第 {j + 1} 条弃权记录无法重演：编号 {entry!r} 当时不在有效"
+                "席位中（弃权顺序被篡改或记录系伪造）"
+            )
+            return
+        if f.get("replacement") != expect:
+            fail(
+                f"第 {j + 1} 条弃权（{entry!r}）的递补不符：包内为 "
+                f"{f.get('replacement')!r}，按规则应为 {expect!r}"
+                "（伪造或跳过的递补）"
+            )
+            return
+        slots[slots.index(entry)] = expect
+
+    if forfeits:
+        ok(f"{len(forfeits)} 条弃权/递补记录按规则从种子与名单重演，全部一致")
+    else:
+        ok("无弃权记录")
+
+    if current is None:
+        fail("核验包缺少 currentWinners（当前有效席位）字段")
+    elif not isinstance(current, list) or len(current) != prize_count:
+        fail("currentWinners 必须是与名额等长的数组")
+    elif current != slots:
+        diffs = []
+        for i, (a, b) in enumerate(zip(current, slots)):
+            if a != b:
+                diffs.append(f"席位 {i + 1}：包内 {a!r}，重演 {b!r}")
+        fail("当前有效席位与弃权重演结果不一致：\n    " + "\n    ".join(diffs[:20]))
+    else:
+        ok("当前有效席位（currentWinners）与弃权重演结果一致")
+
+    if forfeits:
+        print("-" * 68)
+        print("弃权与递补记录（按操作顺序，已经规则重演核对）：")
+        for f in forfeits:
+            rep = f.get("replacement")
+            print(
+                f"  #{str(f.get('seq', '?')):>3} 弃权 {f.get('entry')} → "
+                f"递补 {rep if rep is not None else '（无候补，席位留空）'}"
+            )
+        print("当前有效席位：")
+        for i, s in enumerate(slots, 1):
+            print(f"  {i:>3}. {s if s is not None else '（空席）'}")
 
 
 def main(argv=None):

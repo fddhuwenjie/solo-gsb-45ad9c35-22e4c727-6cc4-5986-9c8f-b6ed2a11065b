@@ -77,6 +77,21 @@
     return hex;
   }
 
+  // 由原始中奖名单与弃权记录逐次原位替换，重演当前有效席位与每席位的递补链。
+  // 返回 { slots: [...当前编号或 null（空席）], chains: [[原, 递补1, ...], ...] }。
+  function replaySlots(winners, forfeits) {
+    var slots = winners.slice();
+    var chains = winners.map(function (w) { return [w]; });
+    (forfeits || []).forEach(function (f) {
+      var idx = slots.indexOf(f.entry);
+      if (idx < 0) return; // 记录无法重演时由核验器另行报错
+      var rep = f.replacement == null ? null : f.replacement;
+      slots[idx] = rep;
+      chains[idx].push(rep == null ? "（空席）" : rep);
+    });
+    return { slots: slots, chains: chains };
+  }
+
   global.LotteryRules = {
     RULE_ID: RULE_ID,
     isHex64: isHex64,
@@ -86,6 +101,7 @@
     listDigest: listDigest,
     commitForSeed: commitForSeed,
     drawWinners: drawWinners,
+    replaySlots: replaySlots,
     generateSeed: generateSeed,
   };
 })(window);
