@@ -125,6 +125,18 @@ td.mono, th.mono { font-family: var(--mono); }
 .winner-row { background: var(--ok-bg); }
 .rank { color: var(--muted); width: 3.2em; }
 
+.seat-badge {
+  display: inline-block;
+  padding: 1px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.seat-orig { background: var(--ok-bg); color: var(--ok); }
+.seat-replaced { background: #e3edff; color: #1d4f9e; }
+.seat-vacant { background: var(--err-bg); color: var(--err); }
+
 dl.meta { display: grid; grid-template-columns: 7.5em 1fr; gap: 4px 12px; margin: 0; font-size: 13px; }
 dl.meta dt { color: var(--muted); }
 dl.meta dd { margin: 0; word-break: break-all; }

@@ -38,6 +38,12 @@
 5. **抽奖规则**：第 `i` 轮（`i=0,1,…`）对每个未中奖编号 `id` 计算
    `score = int_be(SHA256("sha256-argmax-v1|"+seed+"|"+id+"|"+i))`，取分数最大者，
    平局取字节序靠前者。全程不取模，没有取模偏置。
+6. **揭晓后弃权与递补（可选）**：揭晓产生的**原始中奖顺序与揭晓时间永久不变**。
+   揭晓后可在轮次页把某席位的**当前有效中奖编号**标记弃权，系统在同一事务内从
+   **封存名单中“尚未出现”的编号**（原中奖者与历次递补者都排除）按上面完全相同的
+   规则接着选第 `prizeCount、prizeCount+1、…` 轮补入该席位；原中奖者或递补者都能弃权，
+   按操作顺序逐次补位，候补耗尽则该席位留空。重复提交同一次弃权只返回已有结果。
+   详见 [§弃权与递补](#弃权与递补揭晓后可选) 与 [`RULES.md`](RULES.md) 第 4 节。
 
 > 安全性前提：操作者在揭晓前对种子保密；承诺与名单摘要由现场监督方事先独立留存。
 > 服务器只是“承诺托管板 + 防篡改的名单快照”，种子从不被服务器提前掌握。
@@ -105,6 +111,19 @@ docker compose up -d --build
    可修正后重试（失败计数仅作记录，不影响正确揭晓）。
 3. 种子正确 → 页面按产生顺序展示中奖编号、揭晓种子与时间；结果永久固定，
    再次提交任何种子都不会重抽。
+
+### 步骤 4′：揭晓后弃权与递补（可选）
+
+揭晓后的结果区按**席位**展示，每一席都列出“原始中奖者 → 当前在任编号”：
+
+1. 某中奖者（原始中奖者或已递补者均可）弃权时，点该席位的 **“标记弃权”**，
+   可填写弃权说明，确认后系统按 `sha256-argmax-v1` 从封存名单中续选**尚未出现**
+   的编号补入该席位，徽章由“原始中奖”变为“递补中”。
+2. **原始中奖顺序与揭晓时间始终不变**；页面下方“弃权与递补经过”按操作顺序列出
+   每次的席位、弃权编号、递补编号与续选轮次（`drawIndex`）。
+3. 封存名单中已无未出现编号时，弃权席位**留空**（“空席（无候补）”），空席不可再操作。
+4. 展开 **“在本机用种子与封存名单独立重演”**：浏览器只用种子与封存名单快照重算
+   整条弃权—递补链，伪造或跳过的递补会被标红，无需信任服务器返回。
 
 ### 步骤 5：导出与核验
 
@@ -176,6 +195,35 @@ curl -s -X POST localhost:8000/api/rounds/$RID/reveal \
 ```
 
 ```bash
+# 4d) 揭晓后弃权与递补（seat 为 1 起的名次；entryId 必须是该席位“当前”有效中奖编号）
+#     原始中奖顺序为 A003 A005 A001；排列第 4、5 项是 A002、A004
+curl -s -X POST localhost:8000/api/rounds/$RID/waivers \
+  -H 'Content-Type: application/json' \
+  -d '{"seat":1,"entryId":"A003","reason":"本人无法到场"}'
+# {"ok":true,"message":"弃权已登记，按既有规则续选递补编号：A002",
+#  "round":{"winners":["A003","A005","A001"],          # 原始顺序不变
+#           "seats":["A002","A005","A001"],            # 当前席位
+#           "waivers":[{"seq":1,"seat":1,"waivedId":"A003",
+#                       "replacementId":"A002","drawIndex":3,...}]}}
+
+# 递补者也可以弃权：第 1 席当前编号已是 A002
+curl -s -X POST localhost:8000/api/rounds/$RID/waivers \
+  -H 'Content-Type: application/json' \
+  -d '{"seat":1,"entryId":"A002"}'
+# 续选排列下一项 A004（drawIndex=4）；seats 变为 ["A004","A005","A001"]
+
+# 重复提交同一次弃权：返回已有结果（alreadyRecorded），不再递补、不新增记录
+curl -s -X POST localhost:8000/api/rounds/$RID/waivers \
+  -H 'Content-Type: application/json' -d '{"seat":1,"entryId":"A003"}'
+# {"ok":true,"alreadyRecorded":true,"message":"该弃权已登记，重复提交返回已有结果，不再递补",...}
+
+# 未揭晓轮次 → 409；非当前有效中奖编号 → 409；seat 越界/类型错误 → 400
+curl -s -X POST localhost:8000/api/rounds/$RID/waivers \
+  -H 'Content-Type: application/json' -d '{"seat":1,"entryId":"A005"}'
+# {"ok":false,"error":"编号 A005 不是第 1 席的当前有效中奖编号（当前为 A004），只有当前有效中奖编号可以弃权"}
+```
+
+```bash
 # 5) 导出核验包
 curl -s -OJ localhost:8000/api/rounds/$RID/package.zip
 unzip lottery-$RID-package.zip
@@ -190,9 +238,9 @@ unzip lottery-$RID-package.zip
 
 | 文件 | 内容 |
 | --- | --- |
-| `package.json` | 轮次元数据、承诺、种子（未揭晓时为 `null`）、规范名单、名单摘要、规则标识、中奖结果 |
+| `package.json` | 轮次元数据、承诺、种子（未揭晓时为 `null`）、规范名单、名单摘要、规则标识、原始中奖结果 `winners`，以及揭晓后的弃权记录 `waivers` 与当前席位 `seats` |
 | `list.txt` | 规范名单（每行一个编号） |
-| `RULES.md` | 抽奖规则全文 |
+| `RULES.md` | 抽奖规则全文（含弃权—递补第 4 节） |
 | `verify.py` | 独立核验脚本，**仅依赖 Python 3 标准库** |
 
 命令行核验（Python 3.8+，无需安装任何东西）：
@@ -201,13 +249,18 @@ unzip lottery-$RID-package.zip
 python3 verify.py package.json
 ```
 
-脚本**不相信**包里的 `winners` 字段，而是：
+脚本**不相信**包里的 `winners`/`seats` 字段，而是：
 
 1. 用种子重算 `SHA256("COMMIT:"+种子)` 与承诺比对；
 2. 对名单重排、查重并重算规范快照摘要，与包内摘要比对；
-3. 检查中奖编号数量、唯一性、是否都在名单内；
-4. **从种子和名单按 `sha256-argmax-v1` 重新抽奖**，与包内结果逐项比对；
-5. 任何不符逐条打印 `[不符]`，进程以退出码 `1` 结束；全部通过输出“全部核验通过”，退出码 `0`。
+3. 检查原始中奖编号数量、唯一性、是否都在名单内；
+4. **从种子和名单按 `sha256-argmax-v1` 重新抽奖**，与包内原始结果逐项比对；
+5. 对每条弃权记录**只采信其声明的（操作序号、席位、弃权编号）**，把递补编号与
+   续选轮次 `drawIndex` 一律从种子与封存名单**重新续选后逐条比对**，再核对最终
+   `seats` 并确认无人占两个席位——**伪造递补编号、跳过/重排续选轮次、把非当前
+   编号记为弃权都会被具体指出**；
+6. 任何不符逐条打印 `[不符]`，进程以退出码 `1` 结束；全部通过输出“全部核验通过”，退出码 `0`。
+   **旧版核验包（没有 `waivers`/`seats` 字段）按“无弃权”继续正常核验。**
 
 结合事先留存的承诺和名单摘要（推荐的真正“外部”核验）：
 
@@ -232,6 +285,33 @@ zip 也可直接传入：`python3 verify.py lottery-<编号>-package.zip`。
 
 > 封存后、揭晓前也可以导出核验包：此时包内种子与结果为空，核验器核对承诺与名单摘要，
 > 并提示“处于封存（未揭晓）状态”。
+
+### 弃权与递补（揭晓后，可选）
+
+弃权不重新抽奖，只是把揭晓时那条**由种子与封存名单唯一确定的排列接着抽下去**：
+
+- 排列前 `prizeCount` 项是原始中奖者（`drawIndex = 0…prizeCount-1`）；
+- 某席位当前编号弃权时，候选集 = 封存名单 −（原始中奖者 ∪ 历次递补者）；
+  第 1 次成功递补用 `drawIndex = prizeCount`，之后每成功递补一次加 1；
+- 因此已弃权者（已在排列前缀中）不可能再被抽回，**同一编号最多占一个席位**；
+- 候选集为空（所有名单编号都已出现）时弃权 → 席位留空 `null`，不占用 `drawIndex`；
+- 弃权记录只追加、永不修改；幂等键为 `(轮次, 席位, 弃权编号)`。
+
+核验包中相关字段：
+
+```jsonc
+"winners": ["A003", "A005", "A001"],          // 揭晓当时的原始顺序，永久不变
+"waivers": [
+  {"seq": 1, "seat": 1, "waivedId": "A003",   // 第 1 次操作：第 1 席
+   "replacementId": "A002", "drawIndex": 3,   // 续选排列第 3 轮
+   "reason": "本人无法到场", "waivedAt": "…"}
+],
+"seats": ["A002", "A005", "A001"]            // 各席位当前在任编号（空席为 null）
+```
+
+并发安全：弃权的“读当前席位 → 判定是否当前编号 → 写弃权与递补”在同一个
+`BEGIN IMMEDIATE` 事务内完成，同一轮次的并发弃权由 SQLite 写锁强制串行，
+不会出现同一人占两个席位、或只记弃权不记递补。
 
 ---
 
@@ -261,19 +341,19 @@ gunicorn 建议保持单 worker（SQLite 写串行化即可；多线程没有问
 │   ├── __init__.py        # Flask 应用工厂（静态目录指向仓库根 static/）
 │   ├── db.py              # SQLite 连接、建表、IMMEDIATE 写事务、状态机注释
 │   ├── rules.py           # 公开规则的 Python 实现（唯一事实来源之一）
-│   ├── services.py        # 名单/封存/揭晓写流程：事务内重新检查状态再读写
+│   ├── services.py        # 名单/封存/揭晓/弃权写流程：事务内重新检查状态再读写
 │   ├── routes.py          # 页面路由、JSON API、核验包 zip/json 导出
 │   └── templates/         # index / round / verify 三个页面（Jinja2）
-├── tests/                 # 顺序流程回归 + 确定性交错验证 + HTTP 并发不变量
+├── tests/                 # 顺序流程、弃权递补、确定性交错、HTTP 并发不变量
 ├── static/
 │   ├── css/style.css
 │   └── js/
 │       ├── sha256.js      # 纯 JS SHA-256（无需安全上下文/CDN）
-│       ├── rules.js       # 与 Python 等价的浏览器规则实现（BigInt）
+│       ├── rules.js       # 与 Python 等价的浏览器规则实现（BigInt，含弃权重演）
 │       ├── common.js      # fetch/转义/复制/下载工具
 │       ├── index.js       # 生成种子、只交承诺、轮次列表
-│       ├── round.js       # 名单增改、封存、揭晓、导出
-│       └── verify.js      # 浏览器内核验（独立重算）
+│       ├── round.js       # 名单增改、封存、揭晓、弃权递补、导出与本机重演
+│       └── verify.js      # 浏览器内核验（独立重算原始结果与弃权链）
 ├── verify/verify.py       # 独立核验脚本（仅 Python 标准库）
 ├── RULES.md               # 规则全文
 ├── wsgi.py                # gunicorn wsgi:app
@@ -282,17 +362,22 @@ gunicorn 建议保持单 worker（SQLite 写串行化即可；多线程没有问
 └── docker-compose.yml
 ```
 
-状态机：`open`（可改名单）→ `sealed`（快照+摘要固定，等种子）→ `revealed`（结果永久固定）。
+状态机：`open`（可改名单）→ `sealed`（快照+摘要固定，等种子）→ `revealed`（原始结果永久固定；
+此后可登记弃权并按既有排列续选递补）。
 
-并发与事务：名单新增、删除、整体替换与封存都在同一个 `BEGIN IMMEDIATE` 写事务内
-**先重新读取轮次状态与名单、再校验和写入、最后一次提交**。SQLite 的立即写锁使这些
-请求互斥串行，因此“封存读取名单之后、提交之前混入新编号”的交错不会发生：
+并发与事务：名单新增、删除、整体替换、封存与**弃权—递补**都在同一个 `BEGIN IMMEDIATE`
+写事务内**先重新读取轮次状态与名单/席位、再校验和写入、最后一次提交**。SQLite 的立即
+写锁使这些请求互斥串行，因此：
 
-- 名单变更先提交：封存随后在锁内读到变更后的最新名单，按它重新复核人数并保存规范
-  快照、人数与摘要（人数不足仍拒绝封存，轮次保持 `open`）；
-- 封存先提交：之后的任何名单变更在锁内重新检查时看到 `sealed`，一律返回 409，
-  参与者表保持封存时内容，快照与摘要不变；
-- 重复封存返回既有快照（`alreadySealed`），不重算、不覆盖。
+- 名单场景下“封存读取名单之后、提交之前混入新编号”的交错不会发生：
+  - 名单变更先提交：封存随后在锁内读到变更后的最新名单，按它重新复核人数并保存规范
+    快照、人数与摘要（人数不足仍拒绝封存，轮次保持 `open`）；
+  - 封存先提交：之后的任何名单变更在锁内重新检查时看到 `sealed`，一律返回 409，
+    参与者表保持封存时内容，快照与摘要不变；
+  - 重复封存返回既有快照（`alreadySealed`），不重算、不覆盖。
+- 弃权场景下同一轮次的并发弃权严格按到达顺序串行：每次续选都在锁内读到此前已提交的
+  全部弃权结果后再计算，避免同一编号占两个席位或只记弃权不记递补；
+  重复提交同一次弃权返回已有记录（`alreadyRecorded`）。
 
 测试（仅依赖 Flask，标准库 `unittest`，不改动任何既有接口）：
 
@@ -303,6 +388,9 @@ python3 -m unittest discover -t . -s tests -v
 
 - `tests/test_sequential_flow.py`：按本 README 的命令行示例走完整流程，并用包内
   `verify.py` 独立核验导出的 JSON / ZIP 核验包；
+- `tests/test_waivers.py`：弃权—递补全链路——续选与排列一致、逐次补位、候补耗尽
+  留空、幂等、非当前编号/未揭晓拒绝、并发串行不变量，以及核验器对**伪造递补、跳过
+  drawIndex、非当前弃权、序号缺失、一人占两席**的检出与旧版包兼容；
 - `tests/test_interleave.py`：**确定性交错验证**——用两个真实 SQLite 连接手工安排
   新增/整体替换/删除与封存的加锁、阻塞与两种提交先后；
 - `tests/test_concurrent_http.py`：多线程真实 HTTP 请求并发新增/替换 + 封存的
@@ -314,11 +402,12 @@ python3 -m unittest discover -t . -s tests -v
 | --- | --- |
 | `POST /api/rounds` | 创建轮次：`{title, prizeCount, commitment}` |
 | `GET  /api/rounds` | 轮次列表 |
-| `GET  /api/rounds/<id>` | 轮次详情（含名单/快照/结果） |
+| `GET  /api/rounds/<id>` | 轮次详情（含名单/快照/原始结果/`waivers`/当前 `seats`） |
 | `POST /api/rounds/<id>/participants` | 添加编号（仅 open） |
 | `PUT  /api/rounds/<id>/participants` | 整体替换名单（仅 open） |
 | `DELETE /api/rounds/<id>/participants/<编号>` | 删除编号（仅 open） |
 | `POST /api/rounds/<id>/seal` | 封存（人数 ≥ 名额；幂等） |
 | `POST /api/rounds/<id>/reveal` | 提交种子；不匹配保持封存，重复揭晓不重抽 |
-| `GET  /api/rounds/<id>/package.json` | 导出 JSON 核验包 |
+| `POST /api/rounds/<id>/waivers` | 揭晓后弃权并续选递补：`{seat(1起), entryId, reason?}`；非当前编号/未揭晓 409，重复提交返回已有结果 |
+| `GET  /api/rounds/<id>/package.json` | 导出 JSON 核验包（含 `waivers`/`seats`） |
 | `GET  /api/rounds/<id>/package.zip` | 导出 ZIP 核验包（含规则与核验器） |

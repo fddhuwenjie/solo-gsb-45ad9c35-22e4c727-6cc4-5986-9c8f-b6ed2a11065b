@@ -80,25 +80,53 @@
 
 <!-- 结果 -->
 <div class="card" id="resultCard" style="display:none;">
-  <h2>🎉 中奖结果（已永久固定）</h2>
+  <h2>🎉 中奖结果</h2>
   <dl class="meta">
     <dt>揭晓种子</dt><dd><div class="hash-box" id="resultSeed"></div></dd>
     <dt>揭晓时间</dt><dd id="revealedAt" class="mono"></dd>
   </dl>
-  <table style="margin-top:10px;">
-    <thead><tr><th class="rank">名次</th><th>中奖编号</th></tr></thead>
-    <tbody id="winnerList"></tbody>
+  <p class="muted" style="margin-top:8px;">
+    原始中奖顺序与揭晓时间<strong>永久不变</strong>；揭晓后如有人弃权，按既有
+    <span class="mono">sha256-argmax-v1</span> 规则从封存名单中续选“尚未出现”的编号递补，
+    下表各席位始终保留原始中奖者，并展示当前在任编号与递补经过。
+  </p>
+
+  <h3>各席位（原始中奖者 → 当前在任编号）</h3>
+  <table style="margin-top:6px;">
+    <thead>
+      <tr><th class="rank">席位</th><th>原始中奖者</th><th>当前在任编号</th><th>状态</th><th></th></tr>
+    </thead>
+    <tbody id="seatList"></tbody>
   </table>
+
+  <details style="margin-top:14px;" id="replayDetails">
+    <summary>在本机用种子与封存名单独立重演（不信任服务器返回）</summary>
+    <p class="muted">本面板只使用上面揭晓种子与封存名单快照在你的浏览器内重算，伪造或跳过的递补会被标红。</p>
+    <div id="replayOut"></div>
+  </details>
+
+  <h3 style="margin-top:16px;">弃权与递补经过（按操作顺序）</h3>
+  <div id="waiverLogWrap">
+    <p class="muted" id="waiverEmpty">暂无弃权记录。</p>
+    <table id="waiverTable" style="display:none;">
+      <thead>
+        <tr><th class="rank">#</th><th class="rank">席位</th><th>弃权编号</th>
+        <th>递补编号</th><th>续选轮次</th><th>时间</th><th>说明</th></tr>
+      </thead>
+      <tbody id="waiverList"></tbody>
+    </table>
+  </div>
 </div>
 
 <!-- 导出核验包 -->
 <div class="card" id="exportCard" style="display:none;">
   <h2>导出核验包</h2>
   <p class="muted">
-    核验包含种子（未揭晓时为空）、规范名单、名单摘要、规则标识、承诺与结果。
+    核验包含种子（未揭晓时为空）、规范名单、名单摘要、规则标识、原始中奖结果，
+    以及揭晓后的<strong>弃权记录（waivers）与当前席位（seats）</strong>。
     zip 内附 <span class="mono">verify.py</span> 与 <span class="mono">RULES.md</span>，
-    任何人可用 <span class="mono">python3 verify.py 包文件</span> 从种子和名单<strong>独立重算</strong>核对，
-    而不是只比对已保存的中奖列表。
+    任何人可用 <span class="mono">python3 verify.py 包文件</span> 从种子和名单<strong>独立重算</strong>
+    原始中奖与整条弃权—递补链，而不是只比对已保存的结果字段。
   </p>
   <a class="btn" id="zipLink" href="#">下载 ZIP 核验包（推荐）</a>
   <a class="btn secondary" id="jsonLink" href="#">仅下载 package.json</a>

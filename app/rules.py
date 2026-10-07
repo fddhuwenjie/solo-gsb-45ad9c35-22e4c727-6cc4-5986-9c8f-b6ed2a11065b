@@ -79,14 +79,28 @@ def draw_winners(entries: list[str], seed_hex: str, prize_count: int) -> list[st
     pool = sorted(entries, key=lambda e: e.encode("utf-8"))
     winners: list[str] = []
     for i in range(prize_count):
-        best_id = None
-        best_score = -1
-        for entry_id in pool:
-            msg = f"{RULE_ID}|{seed_hex}|{entry_id}|{i}"
-            score = int.from_bytes(hashlib.sha256(utf8(msg)).digest(), "big")
-            if score > best_score:  # 严格大于：平局保留规范顺序靠前者
-                best_score = score
-                best_id = entry_id
+        best_id = next_winner(pool, seed_hex, i)
         winners.append(best_id)
         pool.remove(best_id)
     return winners
+
+
+def next_winner(pool: list[str], seed_hex: str, round_index: int) -> str:
+    """既有排列在第 ``round_index`` 轮的下一个编号（揭晓后续选的原语）。
+
+    ``pool`` 必须恰好是排列前 ``round_index`` 轮结束后“尚未出现”的编号集合
+    （揭晓时取全部封存编号；弃权递补时再排除历次已中奖/已递补编号）。
+    与 :func:`draw_winners` 使用完全相同的散列与平局规则，因此把同一排列
+    接着抽下去，结果只取决于种子与封存名单。调用方负责保证 pool 非空。
+    """
+    if not pool:
+        raise ValueError("候选池为空：封存名单中已无尚未出现的编号")
+    best_id = None
+    best_score = -1
+    for entry_id in pool:  # 调用方传入规范顺序；严格大于保证平局取靠前者
+        msg = f"{RULE_ID}|{seed_hex}|{entry_id}|{round_index}"
+        score = int.from_bytes(hashlib.sha256(utf8(msg)).digest(), "big")
+        if score > best_score:
+            best_score = score
+            best_id = entry_id
+    return best_id

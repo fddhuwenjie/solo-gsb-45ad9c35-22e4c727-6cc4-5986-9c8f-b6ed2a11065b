@@ -58,6 +58,7 @@ def round_public_dict(row, *, include_snapshot: bool = True) -> dict:
     db = get_db()
     participants = services.participant_rows(db, row["id"])
     winners = json.loads(row["winners_json"]) if row["winners_json"] else None
+    waivers = services.waiver_rows(db, row["id"]) if row["status"] == "revealed" else []
     data = {
         "id": row["id"],
         "title": row["title"],
@@ -75,6 +76,22 @@ def round_public_dict(row, *, include_snapshot: bool = True) -> dict:
         "seed": row["seed_hex"],
         "winners": winners,
         "participants": participants,
+        # 弃权/递补（仅揭晓后非空）：原中奖顺序永远看 winners，当前席位看 seats。
+        "waivers": [
+            {
+                "seq": w["seq"],
+                "seat": w["seat"] + 1,  # 对外名次从 1 起
+                "waivedId": w["waivedId"],
+                "replacementId": w["replacementId"],
+                "drawIndex": w["drawIndex"],
+                "reason": w["reason"],
+                "waivedAt": w["waivedAt"],
+            }
+            for w in waivers
+        ],
+        "seats": (
+            services.replay_seats(winners, waivers) if winners is not None else None
+        ),
     }
     if include_snapshot and row["snapshot"] is not None:
         data["snapshot"] = row["snapshot"]
@@ -228,6 +245,38 @@ def reveal_round(round_id):
     )
 
 
+# ---------------------------------------------------------------- 弃权 / 递补
+
+@bp.post("/api/rounds/<round_id>/waivers")
+def mark_waiver(round_id):
+    body = request.get_json(silent=True) or {}
+    db = get_db()
+    try:
+        with transaction(db):
+            result = services.mark_waiver_tx(
+                db, round_id, body.get("seat"),
+                body.get("entryId"), body.get("reason"),
+            )
+    except ApiError as e:
+        return _error_response(e)
+
+    # 取事务后最新的整轮数据，确保返回的 seats/waivers 与库内一致。
+    row = services.get_round(db, round_id)
+    payload = {"ok": True, "round": round_public_dict(row)}
+    if result.get("already_recorded"):
+        payload["alreadyRecorded"] = True
+        payload["message"] = "该弃权已登记，重复提交返回已有结果，不再递补"
+    else:
+        w = result["waiver"]
+        if w["replacementId"] is None:
+            payload["message"] = "弃权已登记：封存名单已无尚未出现的编号，该席位留空"
+        else:
+            payload["message"] = (
+                f"弃权已登记，按既有规则续选递补编号：{w['replacementId']}"
+            )
+    return jsonify(payload)
+
+
 # ---------------------------------------------------------------- 核验包
 
 def build_manifest(row) -> dict:
@@ -239,6 +288,10 @@ def build_manifest(row) -> dict:
         entries_ids = sorted((p["id"] for p in entries),
                              key=lambda e: e.encode("utf-8"))
         count = len(entries_ids)
+
+    winners = json.loads(row["winners_json"]) if row["winners_json"] else None
+    waivers = services.waiver_rows(get_db(), row["id"]) if winners else []
+    seats = services.replay_seats(winners, waivers) if winners else None
 
     return {
         "format": "public-lottery-verification-v1",
@@ -257,10 +310,27 @@ def build_manifest(row) -> dict:
         },
         "participants": entries_ids,
         "participantCount": count,
-        "winners": json.loads(row["winners_json"]) if row["winners_json"] else None,
+        # winners 是揭晓当时一次性写入的原始中奖顺序，永久不变；弃权只追加到
+        # waivers，当前各席位在任编号见 seats（无候补时为 null）。核验器会从
+        # 种子与封存名单独立重演整个弃权链，而不是相信这里的任何结果字段。
+        "winners": winners,
+        "waivers": [
+            {
+                "seq": w["seq"],
+                "seat": w["seat"] + 1,  # 名次从 1 起
+                "waivedId": w["waivedId"],
+                "replacementId": w["replacementId"],
+                "drawIndex": w["drawIndex"],
+                "reason": w["reason"],
+                "waivedAt": w["waivedAt"],
+            }
+            for w in waivers
+        ],
+        "seats": seats,
         "notes": (
-            "用 verify/verify.py 对本文件独立重算校验；切勿只比对本包内 winners 字段。"
-            "封存后（含未揭晓）即可导出并对照事先留存的承诺与名单摘要。"
+            "用 verify/verify.py 对本文件独立重算校验；切勿只比对本包内 winners/seats 字段。"
+            "封存后（含未揭晓）即可导出并对照事先留存的承诺与名单摘要；"
+            "揭晓后的弃权—递补链同样由核验器按 sha256-argmax-v1 从种子与封存名单重演。"
         ),
     }
 

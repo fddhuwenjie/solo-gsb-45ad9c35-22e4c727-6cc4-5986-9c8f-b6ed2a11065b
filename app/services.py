@@ -39,6 +39,54 @@ def participant_rows(conn, round_id: str) -> list[dict]:
     return [{"id": r["entry_id"], "position": r["position"]} for r in rows]
 
 
+def waiver_rows(conn, round_id: str) -> list[dict]:
+    """按操作顺序（seq）返回弃权记录；只追加、永不修改。"""
+    rows = conn.execute(
+        "SELECT seq, seat, waived_id, replacement, draw_index, reason, waived_at "
+        "FROM waivers WHERE round_id=? ORDER BY seq",
+        (round_id,),
+    ).fetchall()
+    return [
+        {
+            "seq": r["seq"],
+            "seat": r["seat"],
+            "waivedId": r["waived_id"],
+            "replacementId": r["replacement"],
+            "drawIndex": r["draw_index"],
+            "reason": r["reason"],
+            "waivedAt": r["waived_at"],
+        }
+        for r in rows
+    ]
+
+
+def replay_seats(winners: list[str], waivers: list[dict]) -> list:
+    """按弃权顺序重演当前席位（与核验器/浏览器同一算法）。
+
+    原始中奖顺序永久不变；每条弃权把对应席位的在任编号标记弃权，并由调用方
+    另行按 ``drawIndex`` 校验/给出递补。这里只依据已保存记录推导“当前编号”，
+    返回长度等于名次数的列表，无候补的席位为 ``None``。
+    """
+    seats = list(winners)
+    for w in sorted(waivers, key=lambda x: x["seq"]):
+        seats[w["seat"]] = w.get("replacementId")
+    return seats
+
+
+def derive_waiver_state(winners: list[str] | None, waivers: list[dict]) -> dict:
+    """汇总给页面/API 的席位与“出现过”的编号集合。
+
+    appeared = 原始中奖者 ∪ 历次递补者（排列前缀），续选时它必须被排除。
+    """
+    winners = winners or []
+    seats = replay_seats(winners, waivers)
+    appeared = set(winners)
+    for w in waivers:
+        if w.get("replacementId"):
+            appeared.add(w["replacementId"])
+    return {"seats": seats, "appeared": appeared}
+
+
 def create_round_tx(conn, title: str, prize_count, commitment: str):
     """创建轮次。调用方已做基础类型校验，这里保留事务内的最终校验。"""
     title = (title or "").strip()
@@ -203,3 +251,113 @@ def reveal_round_tx(conn, round_id: str, raw_seed: str):
     )
     return {"revealed": True, "winners": winners,
             "row": get_round(conn, round_id)}
+
+
+MAX_REASON_LEN = 200
+
+
+def mark_waiver_tx(conn, round_id: str, seat, entry_id, reason=None):
+    """揭晓后登记弃权并在同一事务内续选递补。
+
+    规则（详见 RULES.md 第 4 节）：
+    - 仅 revealed 轮次可操作；未揭晓 → 409；
+    - seat 为 1 起的名次，越界 → 400；entry_id 必须是该席位“当前”有效中奖
+      编号，否则 → 409（原中奖者与递补者的判定方式完全一致）；
+    - 重复提交 (席位, 当前编号) 的弃权 → 幂等返回已有记录，不再续选；
+    - 续选：取封存名单中“尚未出现”的编号（原中奖者与历次递补者都排除），
+      按既有 sha256-argmax-v1 规则在第 draw_index 轮取 argmax；没有候补则
+      席位留空（replacement=NULL，不占用 draw_index）。
+
+    返回 dict：already_recorded 为 True 时是幂等重放。
+    """
+    row = get_round(conn, round_id)
+    if row is None:
+        raise ApiError("轮次不存在", 404)
+    if row["status"] != "revealed":
+        raise ApiError("轮次尚未揭晓，不可登记弃权", 409)
+
+    if not isinstance(seat, int) or isinstance(seat, bool):
+        raise ApiError("seat 必须是名次整数（从 1 起）")
+    winners = json.loads(row["winners_json"])
+    if not 1 <= seat <= len(winners):
+        raise ApiError(
+            f"名次 seat 必须在 1 到 {len(winners)} 之间"
+        )
+    seat_idx = seat - 1
+
+    entry = rules.normalize_entry(entry_id or "")
+    if not entry:
+        raise ApiError("请输入弃权编号 entryId")
+    if "\n" in entry or "\r" in entry or len(entry) > 200:
+        raise ApiError("弃权编号不合法")
+
+    if reason is None:
+        reason = ""
+    if not isinstance(reason, str):
+        raise ApiError("弃权说明 reason 必须是字符串")
+    reason = reason.strip()
+    if len(reason) > MAX_REASON_LEN:
+        raise ApiError(f"弃权说明过长（>{MAX_REASON_LEN} 字符）")
+
+    waivers = waiver_rows(conn, round_id)
+    state = derive_waiver_state(winners, waivers)
+    current = state["seats"][seat_idx]
+
+    # 幂等键 = (轮次, 席位, 弃权编号)：重复提交同一次弃权（重试/刷新后重发，
+    # 即使该席位此后又有递补、entry 已不是当前编号）一律返回那次已有结果，
+    # 不续选、不新增。
+    existing = next(
+        (w for w in waivers
+         if w["seat"] == seat_idx and w["waivedId"] == entry),
+        None,
+    )
+    if existing is not None:
+        return {"already_recorded": True, "waiver": existing}
+
+    # 新的弃权：必须针对该席位“当前”有效中奖编号。
+    # 空席、别人席位的编号、从未在此在任的编号都拒绝。
+    if current is None:
+        raise ApiError("该席位已弃权且无候补，当前为空席，不可再操作", 409)
+    if current != entry:
+        raise ApiError(
+            f"编号 {entry} 不是第 {seat} 席的当前有效中奖编号（当前为 {current}），"
+            "只有当前有效中奖编号可以弃权",
+            409,
+        )
+
+    entries = row["snapshot"].split("\n") if row["snapshot"] else []
+    if entry not in entries:
+        # 理论上不可能（当前编号必然来自名单），保留为最终防线。
+        raise ApiError("弃权编号不在封存名单中", 409)
+
+    # 既有排列的前 prize_count 轮是原中奖；此后每次“成功递补”续一轮。
+    # 留空席（候补耗尽）不消耗轮次。
+    draw_index = row["prize_count"] + sum(
+        1 for w in waivers if w["replacementId"] is not None
+    )
+    remaining = [e for e in entries if e not in state["appeared"]]
+    if remaining:
+        replacement = rules.next_winner(remaining, row["seed_hex"], draw_index)
+        stored_draw_index = draw_index
+    else:
+        replacement = None  # 没有候补：留空席
+        stored_draw_index = None
+
+    seq = (max((w["seq"] for w in waivers), default=0)) + 1
+    ts = now_iso()
+    conn.execute(
+        "INSERT INTO waivers (round_id,seq,seat,waived_id,replacement,draw_index,"
+        "reason,waived_at) VALUES (?,?,?,?,?,?,?,?)",
+        (round_id, seq, seat_idx, entry, replacement, stored_draw_index,
+         reason or None, ts),
+    )
+    waivers_after = waiver_rows(conn, round_id)
+    return {
+        "recorded": True,
+        "waiver": next(
+            w for w in waivers_after
+            if w["seat"] == seat_idx and w["waivedId"] == entry
+        ),
+        "seats": replay_seats(winners, waivers_after),
+        "waivers": waivers_after,
+    }

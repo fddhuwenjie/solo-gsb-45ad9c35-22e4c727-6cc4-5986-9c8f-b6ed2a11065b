@@ -99,6 +99,8 @@
     }
 
     var seed = rnd.seed ? rnd.seed.trim().toLowerCase() : null;
+    var storedWaivers = Array.isArray(pkg.waivers) ? pkg.waivers : [];
+    var storedSeats = pkg.seats;
     if (!seed) {
       heading("结论");
       if (rnd.status === "sealed") {
@@ -131,6 +133,7 @@
     // 关键：独立重抽
     var recalc = LotteryRules.drawWinners(entries, seed, rnd.prizeCount);
     var stored = pkg.winners;
+    var winnersMatch = false;
     if (!Array.isArray(stored)) {
       fail("核验包缺少 winners 数组");
     } else {
@@ -149,11 +152,76 @@
         fail("按公开规则由种子与名单重算的结果与包内结果不一致：\n" + diffs.slice(0, 20).join("\n"));
       } else {
         pass("按规则独立重算 " + rnd.prizeCount + " 个中奖编号，与包内结果完全一致");
+        winnersMatch = true;
       }
     }
 
-    heading("独立重算的中奖编号（按产生顺序）");
+    heading("独立重算的原始中奖编号（按产生顺序，弃权不改变此顺序）");
     recalc.forEach(function (w, i) { info("  " + (i + 1) + ". " + w); });
+
+    // ---- 弃权—递补链：只信 (seq,seat,waivedId)，递补全部由种子+名单重算 ----
+    if (winnersMatch) {
+      if (!Array.isArray(pkg.waivers)) {
+        fail("waivers 字段不是数组");
+      } else {
+        heading("弃权—递补链独立重演");
+        var sim = LotteryRules.replayWaivers(entries, seed, rnd.prizeCount, recalc, storedWaivers);
+        sim.errors.forEach(function (msg) { fail("弃权链重演：" + msg); });
+
+        sim.expected.forEach(function (item) {
+          var w = item.record;
+          var where = "弃权 seq=" + String(w.seq) + "（第 " + w.seat + " 席 " + w.waivedId + "）";
+          if (w.drawIndex !== item.drawIndex) {
+            fail(where + "的 drawIndex 跳过或伪造：包内 " + String(w.drawIndex) +
+                 "，应为 " + String(item.drawIndex));
+          }
+          if ((w.replacementId == null ? null : w.replacementId) !== item.replacement) {
+            fail(where + "的递补编号伪造：包内 " + String(w.replacementId) +
+                 "，按规则续选应为 " + String(item.replacement));
+          }
+        });
+
+        if (storedSeats == null) {
+          if (storedWaivers.length) fail("核验包有弃权记录但缺少 seats（当前席位）字段");
+        } else if (!Array.isArray(storedSeats)) {
+          fail("seats 字段不是数组");
+        } else if (storedSeats.length !== rnd.prizeCount) {
+          fail("seats 数量 " + storedSeats.length + " 不等于名额 " + rnd.prizeCount);
+        } else {
+          var seatDiffs = [];
+          for (var s = 0; s < rnd.prizeCount; s++) {
+            var a = storedSeats[s] == null ? null : storedSeats[s];
+            var b = sim.seats[s] == null ? null : sim.seats[s];
+            if (a !== b) seatDiffs.push("第 " + (s + 1) + " 席：包内 " + String(a) + "，重演 " + String(b));
+          }
+          var occupied = sim.seats.filter(function (x) { return x != null; });
+          if (seatDiffs.length) {
+            fail("当前席位与弃权链独立重演结果不一致：\n" + seatDiffs.slice(0, 20).join("\n"));
+          } else if (new Set(occupied).size !== occupied.length) {
+            fail("重演结果中同一编号占用了多个席位");
+          } else if (storedWaivers.length) {
+            pass("弃权—递补链（" + storedWaivers.length + " 次弃权）独立重演通过，当前席位一致");
+          }
+        }
+
+        if (storedWaivers.length) {
+          sim.expected.forEach(function (item) {
+            var w = item.record;
+            var tail = item.replacement == null
+              ? "→ 无候补，席位留空"
+              : "→ 递补 " + item.replacement + "（排列第 " + item.drawIndex + " 轮）";
+            info("#" + w.seq + "  第 " + w.seat + " 席 " + w.waivedId + " 弃权 " + tail);
+          });
+          info("当前席位：");
+          sim.seats.forEach(function (x, idx) {
+            info("  " + (idx + 1) + ". " + (x == null ? "（空席）" : x) +
+                 "　原始中奖：" + recalc[idx]);
+          });
+        } else {
+          info("无弃权记录：当前席位即原始中奖编号。");
+        }
+      }
+    }
     return finish(failures);
   }
 
